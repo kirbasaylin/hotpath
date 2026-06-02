@@ -1,10 +1,9 @@
-# HotPath
+# PerfForge
 
 Find slow PyTorch code before it burns GPU hours.
 
-HotPath is a small rule-based CLI for detecting common PyTorch performance
-anti-patterns. The v0 focuses on high-confidence checks that are easy to explain
-and usually easy to fix.
+PerfForge is a small rule-based CLI for detecting common PyTorch performance anti-patterns before expensive training runs, CI jobs, or experiments start.
+
 
 > Package note: the PyPI name `hotpath` is used by an unrelated project.
 > This project publishes as `hotpath-ai`, while the command remains `hotpath`.
