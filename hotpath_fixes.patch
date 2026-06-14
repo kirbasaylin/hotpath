@@ -1,0 +1,565 @@
+diff --git a/pyproject.toml b/pyproject.toml
+index 5638553..cedde46 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -41,9 +41,9 @@ classifiers = [
+ ]
+ 
+ [project.urls]
+-Homepage = "https://github.com/kirbasaylin/hotpath"
+-Repository = "https://github.com/kirbasaylin/hotpath"
+-Issues = "https://github.com/kirbasaylin/hotpath/issues"
++Homepage = "https://github.com/kirbasaylin/PerfForge"
++Repository = "https://github.com/kirbasaylin/PerfForge"
++Issues = "https://github.com/kirbasaylin/PerfForge/issues"
+ 
+ [project.scripts]
+ hotpath = "hotpath.cli:main"
+diff --git a/src/hotpath/analyzer.py b/src/hotpath/analyzer.py
+index deaa7a7..f58f2f2 100644
+--- a/src/hotpath/analyzer.py
++++ b/src/hotpath/analyzer.py
+@@ -1,6 +1,7 @@
+ import ast
+ from pathlib import Path
+ 
++from hotpath.cost import annotate
+ from hotpath.models import Finding
+ from hotpath.rules import PyTorchPerformanceVisitor
+ 
+@@ -22,7 +23,7 @@ def analyze_source(source: str, filename: str = "<source>") -> list[Finding]:
+ 
+     visitor = PyTorchPerformanceVisitor(source)
+     visitor.visit(tree)
+-    return visitor.findings()
++    return [annotate(finding) for finding in visitor.findings()]
+ 
+ 
+ def analyze_file(path: Path) -> list[Finding]:
+diff --git a/src/hotpath/cli.py b/src/hotpath/cli.py
+index fc4bff9..cd8db09 100644
+--- a/src/hotpath/cli.py
++++ b/src/hotpath/cli.py
+@@ -48,6 +48,29 @@ def build_parser() -> argparse.ArgumentParser:
+         default="none",
+         help="Exit with status 1 when findings at or above this severity are present.",
+     )
++    analyze.add_argument(
++        "--include-heuristics",
++        action="store_true",
++        help="Show low-confidence (heuristic) findings that are hidden by default.",
++    )
++    analyze.add_argument(
++        "--gpu-hourly",
++        type=float,
++        default=2.50,
++        help="Assumed GPU price per hour for the cost estimate (default: 2.50).",
++    )
++    analyze.add_argument(
++        "--run-hours",
++        type=float,
++        default=12.0,
++        help="Assumed training run length in hours for the cost estimate (default: 12).",
++    )
++    analyze.add_argument(
++        "--gpus",
++        type=int,
++        default=1,
++        help="Assumed number of GPUs for the cost estimate (default: 1).",
++    )
+     return parser
+ 
+ 
+@@ -58,12 +81,31 @@ def main(argv: list[str] | None = None) -> int:
+     if args.command == "analyze":
+         results = analyze_path(args.path)
+         if args.format == "json":
+-            print(json.dumps(json_payload(results), indent=2))
++            print(json.dumps(json_payload(results, args), indent=2))
+         elif len(results) == 1:
+             path, findings = next(iter(results.items()))
+-            print(render_findings(path, findings, min_severity=args.min_severity))
++            print(
++                render_findings(
++                    path,
++                    findings,
++                    min_severity=args.min_severity,
++                    include_heuristics=args.include_heuristics,
++                    gpu_hourly=args.gpu_hourly,
++                    run_hours=args.run_hours,
++                    gpus=args.gpus,
++                )
++            )
+         else:
+-            print(render_project_findings(results, min_severity=args.min_severity))
++            print(
++                render_project_findings(
++                    results,
++                    min_severity=args.min_severity,
++                    include_heuristics=args.include_heuristics,
++                    gpu_hourly=args.gpu_hourly,
++                    run_hours=args.run_hours,
++                    gpus=args.gpus,
++                )
++            )
+         return exit_code(results, args.fail_on)
+ 
+     parser.error(f"Unknown command: {args.command}")
+@@ -90,7 +132,14 @@ def iter_python_files(root: Path):
+         yield path
+ 
+ 
+-def json_payload(results: dict[Path, list]) -> dict:
++def json_payload(results: dict[Path, list], args=None) -> dict:
++    from hotpath.cost import cost_note, estimate_summary
++
++    gpu_hourly = getattr(args, "gpu_hourly", 2.50)
++    run_hours = getattr(args, "run_hours", 12.0)
++    gpus = getattr(args, "gpus", 1)
++
++    all_findings = [f for findings in results.values() for f in findings]
+     return {
+         "files": [
+             {
+@@ -100,8 +149,11 @@ def json_payload(results: dict[Path, list]) -> dict:
+                         "rule_id": finding.rule_id,
+                         "title": finding.title,
+                         "severity": finding.severity,
++                        "impact": finding.impact,
++                        "confidence": finding.confidence,
+                         "line": finding.line,
+                         "message": finding.message,
++                        "cost_note": cost_note(finding.rule_id),
+                         "recommendation": finding.recommendation,
+                         "example": finding.example,
+                     }
+@@ -109,7 +161,10 @@ def json_payload(results: dict[Path, list]) -> dict:
+                 ],
+             }
+             for path, findings in results.items()
+-        ]
++        ],
++        "cost_summary": estimate_summary(
++            all_findings, gpu_hourly, run_hours, gpus
++        ),
+     }
+ 
+ 
+diff --git a/src/hotpath/cost.py b/src/hotpath/cost.py
+new file mode 100644
+index 0000000..b94f2ec
+--- /dev/null
++++ b/src/hotpath/cost.py
+@@ -0,0 +1,174 @@
++"""Impact and cost framing for HotPath findings.
++
++This module is what makes HotPath different from a generic linter. Other tools
++tell you *what* is wrong. HotPath also tells you, in plain terms, how much it is
++likely *costing you* and which findings are worth your attention first.
++
++Honesty note: static analysis cannot measure a real training run. We never
++pretend to. Every rule carries a coarse impact tier, and the aggregate dollar
++figure is an explicitly-labelled illustration based on assumptions you control
++(`--gpu-hourly`, `--run-hours`, `--gpus`). The real number comes from a profiler
++run -- that is the `hotpath profile` milestone on the roadmap.
++"""
++
++from dataclasses import replace
++
++from hotpath.models import Finding
++
++# ---------------------------------------------------------------------------
++# Per-rule metadata
++# ---------------------------------------------------------------------------
++# confidence: how trustworthy the detection is with static info only.
++#   "high"      -> precise AST match, very low false-positive rate
++#   "medium"    -> inferential, usually right, occasional false positive
++#   "heuristic" -> broad pattern, fires on legitimate code; hidden by default
++#
++# impact: rough magnitude of GPU time / cost when the issue is real.
++#   "high"   -> can move training throughput by a large margin (~10-30%+)
++#   "medium" -> a real but smaller tax (~1-10%)
++#   "low"    -> good hygiene, marginal cost on its own
++
++CONFIDENCE: dict[str, str] = {
++    "KP001": "high",      # DataLoader num_workers
++    "KP002": "high",      # pin_memory
++    "KP003": "high",      # .item() in loop
++    "KP004": "high",      # device transfer in loop
++    "KP005": "high",      # cpu tensor creation in loop
++    "KP006": "medium",    # manual attention pattern (co-occurrence)
++    "KP007": "medium",    # missing torch.compile (file-level inference)
++    "KP008": "medium",    # missing autocast (file-level inference)
++    "KP009": "heuristic",  # python loop may block vectorization (very broad)
++    "KP010": "high",      # zero_grad set_to_none
++    "KP011": "high",      # empty_cache in loop
++    "KP012": "heuristic",  # eval without no_grad (file-level, many FPs)
++    "KP013": "high",      # torch.tensor copy
++    "KP014": "high",      # persistent_workers
++    "KP015": "high",      # non_blocking
++    "KP016": "high",      # save in loop
++    "KP017": "high",      # numpy in loop
++}
++
++IMPACT: dict[str, str] = {
++    "KP001": "high",      # input pipeline stalls can bottleneck the whole run
++    "KP002": "medium",
++    "KP003": "high",      # GPU sync in the hot loop
++    "KP004": "high",      # repeated transfers / sync in the hot loop
++    "KP005": "medium",
++    "KP006": "high",      # naive attention vs fused/Flash kernels
++    "KP007": "high",      # torch.compile commonly 1.2-2x
++    "KP008": "high",      # mixed precision commonly 1.3-2x + memory
++    "KP009": "low",
++    "KP010": "low",       # set_to_none is real but small
++    "KP011": "medium",
++    "KP012": "low",
++    "KP013": "low",
++    "KP014": "medium",
++    "KP015": "medium",
++    "KP016": "medium",
++    "KP017": "medium",
++}
++
++# Short, money-oriented reason shown next to each finding.
++COST_NOTE: dict[str, str] = {
++    "KP001": "data loading can starve the GPU, leaving paid silicon idle",
++    "KP002": "un-pinned memory slows every host-to-GPU batch copy",
++    "KP003": "forces the CPU to wait for the GPU on every iteration",
++    "KP004": "adds transfer + sync overhead on every iteration",
++    "KP005": "allocates on CPU then pays for a copy to the GPU",
++    "KP006": "hand-rolled attention misses fused/Flash kernels",
++    "KP007": "skips graph compilation that often gives a large free speedup",
++    "KP008": "full precision wastes throughput and GPU memory",
++    "KP009": "per-item Python work can leave the GPU underutilized",
++    "KP010": "extra memory writes when zeroing gradients",
++    "KP011": "empty_cache in the loop stalls training for no real benefit",
++    "KP012": "builds unnecessary autograd graphs during evaluation",
++    "KP013": "an avoidable tensor copy",
++    "KP014": "worker processes restart every epoch",
++    "KP015": "blocking copies that can't overlap with compute",
++    "KP016": "disk I/O on the hot path stalls the GPU",
++    "KP017": "forces a CPU sync / device copy mid-loop",
++}
++
++# Illustrative throughput-recovery bands per dominant impact tier. Deliberately
++# conservative and presented as a range, never a point estimate.
++_BANDS = {
++    "high": (0.10, 0.30),
++    "medium": (0.02, 0.10),
++    "low": (0.00, 0.02),
++}
++
++_IMPACT_RANK = {"high": 2, "medium": 1, "low": 0}
++
++
++def annotate(finding: Finding) -> Finding:
++    """Attach confidence and impact to a finding based on its rule id."""
++    return replace(
++        finding,
++        confidence=CONFIDENCE.get(finding.rule_id, finding.confidence),
++        impact=IMPACT.get(finding.rule_id, finding.impact),
++    )
++
++
++def cost_note(rule_id: str) -> str | None:
++    return COST_NOTE.get(rule_id)
++
++
++def dominant_impact(findings: list[Finding]) -> str:
++    """The highest impact tier present among visible findings."""
++    best = "low"
++    for f in findings:
++        if _IMPACT_RANK.get(f.impact, 0) > _IMPACT_RANK.get(best, 0):
++            best = f.impact
++    return best
++
++
++def estimate_summary(
++    findings: list[Finding],
++    gpu_hourly: float = 2.50,
++    run_hours: float = 12.0,
++    gpus: int = 1,
++) -> str:
++    """A short, honest, dollar-anchored summary for a set of findings.
++
++    The aggregate is intentionally an illustration: it anchors on a single
++    conservative slowdown band for the highest-impact issue present, rather than
++    summing rules (which would double-count and overclaim).
++    """
++    if not findings:
++        return ""
++
++    counts = {"high": 0, "medium": 0, "low": 0}
++    for f in findings:
++        counts[f.impact] = counts.get(f.impact, 0) + 1
++
++    run_cost = gpu_hourly * run_hours * max(gpus, 1)
++    tier = dominant_impact(findings)
++    low_frac, high_frac = _BANDS[tier]
++    low_dollars = run_cost * low_frac
++    high_dollars = run_cost * high_frac
++
++    lines = []
++    lines.append(
++        f"Impact: {counts['high']} high, {counts['medium']} medium, "
++        f"{counts['low']} low."
++    )
++    lines.append(
++        f"Reference run: {gpus}x GPU x {run_hours:g}h @ ${gpu_hourly:.2f}/h "
++        f"= ${run_cost:,.0f}."
++    )
++    if tier == "low":
++        lines.append(
++            "No high-impact issues found. Remaining items are hygiene-level; "
++            "savings are marginal on their own."
++        )
++    else:
++        lines.append(
++            f"Addressing the {tier}-impact findings could plausibly recover "
++            f"~{low_frac*100:.0f}-{high_frac*100:.0f}% of throughput, on the "
++            f"order of ${low_dollars:,.0f}-${high_dollars:,.0f} per run "
++            f"(illustrative)."
++        )
++    lines.append(
++        "Estimate only -- assumptions are yours to set; profile to confirm."
++    )
++    return "\n".join(lines)
+diff --git a/src/hotpath/models.py b/src/hotpath/models.py
+index 191feae..cd3e5ea 100644
+--- a/src/hotpath/models.py
++++ b/src/hotpath/models.py
+@@ -10,3 +10,10 @@ class Finding:
+     message: str
+     recommendation: str
+     example: str | None = None
++    # How likely this finding is a true positive given only static information.
++    # One of: "high", "medium", "heuristic". Heuristic findings are hidden by
++    # default so a noisy rule can never erode trust in the precise ones.
++    confidence: str = "high"
++    # Rough magnitude of GPU time / cost if the issue is real.
++    # One of: "high", "medium", "low".
++    impact: str = "medium"
+diff --git a/src/hotpath/report.py b/src/hotpath/report.py
+index 8a7d0fa..ae6b47f 100644
+--- a/src/hotpath/report.py
++++ b/src/hotpath/report.py
+@@ -1,17 +1,42 @@
+ from pathlib import Path
+ 
++from hotpath.cost import cost_note, estimate_summary
+ from hotpath.models import Finding
+ 
+ SEVERITY_ORDER = {"info": 0, "warning": 1, "error": 2}
+ 
+ 
++def _visible(
++    findings: list[Finding],
++    min_severity: str,
++    include_heuristics: bool,
++) -> list[Finding]:
++    threshold = SEVERITY_ORDER[min_severity]
++    out = []
++    for f in findings:
++        if SEVERITY_ORDER[f.severity] < threshold:
++            continue
++        if f.confidence == "heuristic" and not include_heuristics:
++            continue
++        out.append(f)
++    return out
++
++
++def _impact_tag(finding: Finding) -> str:
++    return {"high": "$$$", "medium": "$$", "low": "$"}.get(finding.impact, "$")
++
++
+ def render_findings(
+     path: Path,
+     findings: list[Finding],
+     min_severity: str = "info",
++    include_heuristics: bool = False,
++    gpu_hourly: float = 2.50,
++    run_hours: float = 12.0,
++    gpus: int = 1,
+ ) -> str:
+-    threshold = SEVERITY_ORDER[min_severity]
+-    visible = [f for f in findings if SEVERITY_ORDER[f.severity] >= threshold]
++    visible = _visible(findings, min_severity, include_heuristics)
++    hidden = len(findings) - len(visible)
+ 
+     lines = [f"HotPath analysis: {path}", ""]
+     if not visible:
+@@ -20,9 +45,12 @@ def render_findings(
+ 
+     for index, finding in enumerate(visible, start=1):
+         lines.append(
+-            f"{index}. [{finding.severity.upper()}] {finding.title} "
+-            f"({finding.rule_id})"
++            f"{index}. [{finding.severity.upper()}] {_impact_tag(finding)} "
++            f"{finding.title} ({finding.rule_id})"
+         )
++        note = cost_note(finding.rule_id)
++        if note:
++            lines.append(f"   Why it costs: {note}.")
+         lines.append(f"   Line {finding.line}: {finding.message}")
+         lines.append(f"   Fix: {finding.recommendation}")
+         if finding.example:
+@@ -31,16 +59,25 @@ def render_findings(
+                 lines.append(f"     {example_line}")
+         lines.append("")
+ 
++    lines.append(estimate_summary(visible, gpu_hourly, run_hours, gpus))
++    if hidden:
++        lines.append(
++            f"({hidden} low-confidence finding(s) hidden -- "
++            f"pass --include-heuristics to show.)"
++        )
+     return "\n".join(lines).rstrip()
+ 
+ 
+ def render_project_findings(
+     results: dict[Path, list[Finding]],
+     min_severity: str = "info",
++    include_heuristics: bool = False,
++    gpu_hourly: float = 2.50,
++    run_hours: float = 12.0,
++    gpus: int = 1,
+ ) -> str:
+-    threshold = SEVERITY_ORDER[min_severity]
+     files_with_visible = {
+-        path: [f for f in findings if SEVERITY_ORDER[f.severity] >= threshold]
++        path: _visible(findings, min_severity, include_heuristics)
+         for path, findings in results.items()
+     }
+     files_with_visible = {
+@@ -48,7 +85,12 @@ def render_project_findings(
+     }
+ 
+     total = sum(len(findings) for findings in files_with_visible.values())
+-    lines = [f"HotPath project analysis: {total} findings across {len(files_with_visible)} files", ""]
++    all_visible = [f for findings in files_with_visible.values() for f in findings]
++    lines = [
++        f"HotPath project analysis: {total} findings across "
++        f"{len(files_with_visible)} files",
++        "",
++    ]
+     if not files_with_visible:
+         lines.append("No findings at the selected severity.")
+         return "\n".join(lines)
+@@ -57,9 +99,11 @@ def render_project_findings(
+         lines.append(str(path))
+         for finding in findings:
+             lines.append(
+-                f"  [{finding.severity.upper()}] {finding.rule_id} line {finding.line}: "
+-                f"{finding.title}"
++                f"  [{finding.severity.upper()}] {_impact_tag(finding)} "
++                f"{finding.rule_id} line {finding.line}: {finding.title}"
+             )
+             lines.append(f"    {finding.recommendation}")
+         lines.append("")
++
++    lines.append(estimate_summary(all_visible, gpu_hourly, run_hours, gpus))
+     return "\n".join(lines).rstrip()
+diff --git a/src/hotpath/rules.py b/src/hotpath/rules.py
+index 0084201..7c6cbe2 100644
+--- a/src/hotpath/rules.py
++++ b/src/hotpath/rules.py
+@@ -341,7 +341,10 @@ class PyTorchPerformanceVisitor(ast.NodeVisitor):
+             return any(token in node.id.lower() for token in LOOP_TOKENS)
+         if isinstance(node, ast.Call):
+             name = dotted_name(node.func)
+-            return bool(name and (name.endswith("DataLoader") or name.startswith("range")))
++            # Only data iteration (e.g. a DataLoader) is a vectorization smell.
++            # Plain range() loops are the normal epoch/step counters and must
++            # not be flagged, or trust in the rule collapses.
++            return bool(name and name.endswith("DataLoader"))
+         if isinstance(node, ast.Attribute):
+             return any(token in node.attr.lower() for token in LOOP_TOKENS)
+         return False
+diff --git a/tests/test_cost.py b/tests/test_cost.py
+new file mode 100644
+index 0000000..91fe0d4
+--- /dev/null
++++ b/tests/test_cost.py
+@@ -0,0 +1,81 @@
++import unittest
++
++from hotpath.analyzer import analyze_source
++from hotpath.cost import dominant_impact, estimate_summary
++from hotpath.report import render_findings, _visible
++from pathlib import Path
++
++
++TRAIN = """
++import torch
++from torch.utils.data import DataLoader
++
++loader = DataLoader(dataset, batch_size=32, num_workers=0)
++for batch in loader:
++    x = batch.to(device)
++    loss = model(x).mean()
++    loss.backward()
++    print(loss.item())
++"""
++
++
++class CostAnnotationTests(unittest.TestCase):
++    def test_findings_carry_impact_and_confidence(self) -> None:
++        findings = analyze_source(TRAIN)
++        self.assertTrue(findings)
++        for f in findings:
++            self.assertIn(f.impact, {"high", "medium", "low"})
++            self.assertIn(f.confidence, {"high", "medium", "heuristic"})
++
++    def test_dataloader_workers_is_high_impact(self) -> None:
++        by_id = {f.rule_id: f for f in analyze_source(TRAIN)}
++        self.assertEqual(by_id["KP001"].impact, "high")
++
++    def test_dominant_impact_picks_highest(self) -> None:
++        self.assertEqual(dominant_impact(analyze_source(TRAIN)), "high")
++
++    def test_estimate_summary_scales_with_assumptions(self) -> None:
++        findings = analyze_source(TRAIN)
++        cheap = estimate_summary(findings, gpu_hourly=1.0, run_hours=1, gpus=1)
++        pricey = estimate_summary(findings, gpu_hourly=4.0, run_hours=100, gpus=8)
++        self.assertIn("Impact:", cheap)
++        # A bigger, pricier run must produce a larger reference cost.
++        self.assertNotEqual(cheap, pricey)
++
++    def test_empty_findings_have_no_summary(self) -> None:
++        self.assertEqual(estimate_summary([]), "")
++
++
++class HeuristicGatingTests(unittest.TestCase):
++    def test_range_loop_is_not_flagged_as_vectorization_issue(self) -> None:
++        source = """
++import torch
++for epoch in range(10):
++    train_one_epoch(model)
++"""
++        self.assertNotIn("KP009", {f.rule_id for f in analyze_source(source)})
++
++    def test_heuristics_hidden_by_default_shown_on_request(self) -> None:
++        source = """
++import torch
++model.eval()
++out = model(x)
++"""
++        findings = analyze_source(source)
++        # KP012 is heuristic; it exists in the raw findings...
++        self.assertIn("KP012", {f.rule_id for f in findings})
++        # ...but is filtered out of the default view...
++        default_view = _visible(findings, "info", include_heuristics=False)
++        self.assertNotIn("KP012", {f.rule_id for f in default_view})
++        # ...and reappears when explicitly requested.
++        full_view = _visible(findings, "info", include_heuristics=True)
++        self.assertIn("KP012", {f.rule_id for f in full_view})
++
++    def test_render_hides_heuristics_by_default(self) -> None:
++        findings = analyze_source("import torch\nmodel.eval()\nout = model(x)\n")
++        text = render_findings(Path("x.py"), findings)
++        self.assertNotIn("KP012", text)
++
++
++if __name__ == "__main__":
++    unittest.main()
